@@ -13,78 +13,86 @@ import (
 
 var (
 	verbose            = kingpin.Flag("verbose", "Verbose mode.").Short('v').Bool()
-	upstream           = kingpin.Flag("upstream.addr", "upstream to connect to").Required().String()
-	upstreamPrefixPath = kingpin.Flag("upstream.prefix-path", "upstream prefix path to prepend").String()
+    upstreamUrl        = kingpin.Flag("upstream.url", "upstream to proxy the request to").Required().String()
 	listenAddr         = kingpin.Flag("proxy.listen-addr", "address the proxy will listen on").Required().String()
 
 	urlPattern           = regexp.MustCompile(`^/([^/]+)(/api/v.+)$`)
+    queryPathPattern     = regexp.MustCompile(`^/api/v1/(query|query_range|query_exemplars)$`)
+    matchPathPattern     = regexp.MustCompile(`^/api/v1/(series|labels|label/[a-zA-Z_][a-zA-Z0-9_]*/values|)`)
 	supportedPathPattern = regexp.MustCompile(`^/api/v1/(query|query_range|query_exemplars|series|label/[a-zA-Z0-9_]+/values)$`)
 )
 
-func handleQuery(filter string, rw http.ResponseWriter, r *http.Request) {
-	log.WithFields(log.Fields{"method": r.Method, "path": r.URL.String(), "filter": filter}).Debug("handling request")
-	params := &url.Values{}
-	err := r.ParseForm()
-	if err != nil {
-		log.WithFields(log.Fields{"err": err}).Warn("failed to parse query string")
-		rw.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	for k, vv := range r.Form {
-		log.WithFields(log.Fields{"k": k}).Debug("handling form key")
-		switch k {
-		case "query":
-			if len(vv) != 1 {
-				log.WithFields(log.Fields{"method": r.Method, "path": r.URL.String()}).Warn("wrong number of query params")
-				rw.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			val, err := addQueryFilter(filter, vv[0])
-			if err != nil {
-				log.WithFields(log.Fields{"val": vv[0], "err": err}).Warn("failed to add filter")
-				rw.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			params.Set(k, val)
-		case "match[]":
-			log.WithFields(log.Fields{"val": vv}).Debug("rewriting match")
-			for _, v := range vv {
-				val, err := addQueryFilter(filter, v)
-				if err != nil {
-					log.WithFields(log.Fields{"val": v, "err": err}).Warn("failed to add filter")
-					rw.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				params.Add(k, val)
-			}
-		case "start":
-			fallthrough
-		case "end":
-			fallthrough
-		case "step":
-			fallthrough
-		case "time":
-			for _, v := range vv {
-				params.Add(k, v)
-			}
-		default:
-			log.WithFields(log.Fields{"key": k, "values": vv}).Warn("unknown param")
-			continue
-		}
-	}
-	url := &url.URL{
-		Scheme:   "http",
-		Host:     *upstream,
-		Path:     fmt.Sprintf("%s%s", *upstreamPrefixPath, r.URL.Path), //FIXME
-		RawQuery: params.Encode(),
-	}
-	log.WithFields(log.Fields{"url": url.String()}).Debug("starting request to upstream")
-	resp, err := http.Get(url.String())
-	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		log.WithFields(log.Fields{"err": err}).Warn("upstream request failed")
-		return
-	}
+func handleQuery(filter string, values url.Values) (url.Values, error) {
+    if values.Has("query") {
+        filteredQuery, err := addQueryFilter(filter, values.Get("query"))
+        if err != nil {
+            return values, err
+        }
+        values.Set("query", filteredQuery)
+    }
+    return values, nil
+}
+
+func handleMatch(filter string, values url.Values) (url.Values, error) {
+    if values.Has("match[]") {
+        oldMatchers := values["match[]"]
+        values.Del("match[]")
+        for _, m := range oldMatchers {
+            filtered, err := addQueryFilter(filter, m)
+            if err != nil {
+                return values, err
+            }
+            values.Add("match[]", filtered)
+        }
+    } else {
+        values.Add("match[]", filter)
+    }
+    return values, nil
+}
+
+func handleValues(apiPath string, filter string, values url.Values) (url.Values, error) {
+    if queryPathPattern.MatchString(apiPath) {
+        return handleQuery(filter, values)
+    } else if matchPathPattern.MatchString(apiPath) {
+        return handleMatch(filter, values)
+    }
+    return values, nil
+}
+
+func handleAPIRequest(filter string, apiPath string, rw http.ResponseWriter, req *http.Request) error {
+	log.WithFields(log.Fields{"method": req.Method, "path": req.URL.String(), "filter": filter}).Debug("handling request")
+
+    req.ParseForm()
+
+    newURL, err := url.Parse(*upstreamUrl)
+    if err != nil {
+        return err
+    }
+    newURL.Path = fmt.Sprintf("%s/%s", newURL.Path, apiPath)
+    getValues, err := handleValues(apiPath, filter, req.Form)
+    if err != nil {
+        return err
+    }
+    newURL.RawQuery = getValues.Encode()
+
+    var resp *http.Response
+	log.WithFields(log.Fields{"url": newURL.String()}).Debug("starting request to upstream")
+    if req.Method == "GET" {
+        resp, err = http.Get(newURL.String())
+        if err != nil {
+            return err
+        }
+    } else {
+        postValues, err := handleValues(apiPath, filter, req.PostForm)
+        if err != nil {
+            return err
+        }
+        resp, err = http.PostForm(newURL.String(), postValues)
+        if err != nil {
+            return err
+        }
+    }
+
 	h := rw.Header()
 	for k, vv := range resp.Header {
 		if k == "Content-Length" {
@@ -95,13 +103,9 @@ func handleQuery(filter string, rw http.ResponseWriter, r *http.Request) {
 			h.Add(k, v)
 		}
 	}
-	rw.WriteHeader(resp.StatusCode)
-	_, err = io.Copy(rw, resp.Body)
-	if err != nil {
-		rw.WriteHeader(http.StatusInternalServerError)
-		log.WithFields(log.Fields{"err": err}).Warn("forwarding upstream response failed")
-		return
-	}
+    rw.WriteHeader(resp.StatusCode)
+    _, err = io.Copy(rw, resp.Body)
+    return err
 }
 
 func handleUnsupported(rw http.ResponseWriter, r *http.Request) {
@@ -126,20 +130,16 @@ func (r router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		handleUnsupported(rw, req)
 		return
 	}
-	filter := "{" + m[1] + "}"
-	apiPath := m[2]
-	if !supportedPath(apiPath) {
-		rw.WriteHeader(http.StatusBadRequest)
-		rw.Write([]byte("prometheus-filter-proxy: Unsupported path\n"))
-		log.WithFields(log.Fields{"method": req.Method, "path": req.URL.String()}).Warn("unsupported path")
-		return
-	}
-	req.URL.Path = apiPath
-	handleQuery(filter, rw, req)
-}
 
-func supportedPath(path string) bool {
-	return supportedPathPattern.MatchString(path)
+	filter := fmt.Sprintf("{ %s }", m[1])
+	apiPath := m[2]
+
+    err := handleAPIRequest(filter, apiPath, rw, req)
+    if err != nil {
+        rw.WriteHeader(http.StatusInternalServerError)
+        rw.Write([]byte("Internal server error\n"))
+        log.WithFields(log.Fields{"err": err}).Warn("Internal Error")
+    }
 }
 
 func main() {
@@ -149,7 +149,7 @@ func main() {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	log.WithFields(log.Fields{"upstream.url": *upstream, "proxy.listen-addr": *listenAddr}).Info("Starting")
+	log.WithFields(log.Fields{"upstream.url": *upstreamUrl, "proxy.listen-addr": *listenAddr}).Info("Starting")
 	router := router{}
 	http.Handle("/", router)
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
